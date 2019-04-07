@@ -17,7 +17,6 @@ import org.apache.hadoop.yarn.client.api.YarnClientApplication;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.util.Apps;
-import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.Records;
 
 import javax.xml.bind.DatatypeConverter;
@@ -25,7 +24,9 @@ import java.io.File;
 import java.io.IOException;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
 
 /**
  * Drill on YARN客户端
@@ -34,6 +35,9 @@ import java.util.*;
  * @author 徐洁阳
  */
 public class DrillOnYarnClient extends Configured implements Tool {
+    private YarnClient yarnClient;
+    private Configuration yarnConfig;
+
     public static void main(String[] args) {
         int status = -1;
         try {
@@ -83,30 +87,38 @@ public class DrillOnYarnClient extends Configured implements Tool {
     }
 
     private void start(Properties config) {
-        FileStatus drillFileStatus = upload(config);
-
-        Configuration yarnConfig = new YarnConfiguration(getConf());
-
-        YarnClient client = createYarnClient(yarnConfig);
-
-        YarnClientApplication application = createApplication(client);
-
-        ApplicationSubmissionContext applicationContext = createApplicationContext(config, application);
-
-        ContainerLaunchContext amContainer = createAMContainer(drillFileStatus, yarnConfig, config);
-
-        applicationContext.setAMContainerSpec(amContainer);
-        submitApplication(client, applicationContext);
-        ApplicationId applicationId = applicationContext.getApplicationId();
-        System.out.println("application id is  " + applicationId);
-
         try {
-            reportApplication(config, client, applicationId);
-        } catch (YarnException | IOException e) {
-            throw new RuntimeException("get application report error", e);
-        } finally {
-            closeYarnClient(client);
+            FileStatus fileStatus = upload(config);
+
+            yarnConfig = new YarnConfiguration(getConf());
+
+            yarnClient = initYarnClient();
+
+            YarnClientApplication application = createYarnApplication(yarnClient);
+
+            ApplicationSubmissionContext applicationContext = createApplicationContext(config, application);
+
+            ContainerLaunchContext amContainer = createAMContainer(fileStatus, config);
+
+            applicationContext.setAMContainerSpec(amContainer);
+
+            submitApplication(yarnClient, applicationContext);
+
+            ApplicationId applicationId = applicationContext.getApplicationId();
+            System.out.println("application id is  " + applicationId);
+
+            reportApplication(yarnClient, applicationId);
+        } catch (Exception e) {
+            e.printStackTrace();
+            try {
+                if (yarnClient != null) {
+                    yarnClient.close();
+                }
+            } catch (IOException e1) {
+                e1.printStackTrace();
+            }
         }
+
     }
 
     private FileStatus upload(Properties config) {
@@ -131,96 +143,58 @@ public class DrillOnYarnClient extends Configured implements Tool {
         return drillFileStatus;
     }
 
-    private YarnClient createYarnClient(Configuration yarnConfig) {
-        System.out.println("start create yarn client");
-        YarnClient client = YarnClient.createYarnClient();
-        client.init(yarnConfig);
-        client.start();
-        System.out.println("end create yarn client");
+    private YarnClient initYarnClient() {
+        System.out.println("start create yarn yarnClient");
+        YarnClient client = YarnUtil.initYarnClient(yarnConfig);
+        System.out.println("end create yarn yarnClient");
         return client;
     }
 
-    private YarnClientApplication createApplication(YarnClient client) {
+    private YarnClientApplication createYarnApplication(YarnClient client) {
         System.out.println("start create application");
-        YarnClientApplication app;
-        try {
-            app = client.createApplication();
-        } catch (YarnException | IOException e) {
-            throw new RuntimeException("error createApplication", e);
-        }
+        YarnClientApplication application = YarnUtil.createYarnApplication(client);
         System.out.println("end create application");
-        return app;
+        return application;
     }
 
     private ApplicationSubmissionContext createApplicationContext(Properties config, YarnClientApplication application) {
         System.out.println("start create application context");
-        ApplicationSubmissionContext applicationContext = application.getApplicationSubmissionContext();
-        applicationContext.setApplicationId(application.getNewApplicationResponse().getApplicationId());
-        applicationContext.setApplicationName(config.getProperty("app.name"));
-        applicationContext.setQueue(config.getProperty("app.queue"));
-        applicationContext.setPriority(Priority.newInstance(Integer.parseInt(config.getProperty("app.priority"))));
-        applicationContext.setResource(Resource.newInstance(Integer.parseInt(config.getProperty("am.memory")),
-                Integer.parseInt(config.getProperty("am.vCores"))));
+        ApplicationSubmissionContext applicationContext = YarnUtil.createYarnApplicationContext(application, config.getProperty("app.name"),
+                config.getProperty("app.queue"), Integer.parseInt(config.getProperty("app.priority")),
+                Integer.parseInt(config.getProperty("am.memory")), Integer.parseInt(config.getProperty("am.vCores")));
         System.out.println("end create application context");
         return applicationContext;
     }
 
-    private ContainerLaunchContext createAMContainer(FileStatus drillFileStatus, Configuration yarnConfig, Properties config) {
+    private ContainerLaunchContext createAMContainer(FileStatus fileStatus, Properties config) {
         System.out.println("start create am container");
         ContainerLaunchContext amContainer = Records.newRecord(ContainerLaunchContext.class);
 
-        setAMContainerResources(amContainer, drillFileStatus);
+        setAMContainerResources(amContainer, fileStatus);
 
         setAMContainerEnvironment(amContainer, yarnConfig, config);
 
-        setAMContainerCommand(amContainer, drillFileStatus, config);
+        setAMContainerCommand(amContainer, fileStatus, config);
         System.out.println("end create am container");
         return amContainer;
     }
 
-    private void setAMContainerResources(ContainerLaunchContext amContainer, FileStatus drillFileStatus) {
+    private void setAMContainerResources(ContainerLaunchContext amContainer, FileStatus fileStatus) {
         System.out.println("start set am container resources");
-        Map<String, LocalResource> amLocalResources = new LinkedHashMap<>();
-        LocalResource drill = Records.newRecord(LocalResource.class);
-        drill.setResource(ConverterUtils.getYarnUrlFromPath(drillFileStatus.getPath()));
-        drill.setSize(drillFileStatus.getLen());
-        drill.setTimestamp(drillFileStatus.getModificationTime());
-        drill.setType(LocalResourceType.ARCHIVE);
-        drill.setVisibility(LocalResourceVisibility.PUBLIC);
-        amLocalResources.put(drillFileStatus.getPath().getName(), drill);
-        amContainer.setLocalResources(amLocalResources);
+        amContainer.setLocalResources(YarnUtil.buildResource(fileStatus, LocalResourceType.ARCHIVE, LocalResourceVisibility.PUBLIC));
         System.out.println("emd set am container resources");
     }
 
     private void setAMContainerCommand(ContainerLaunchContext amContainer, FileStatus drillFileStatus, Properties config) {
         System.out.println("start set am container command");
-        // 设置command
-        List<String> commands = new ArrayList<>();
-        commands.add(ApplicationConstants.Environment.SHELL.$$());
-        commands.add(drillFileStatus.getPath().getName() + "/" + config.getProperty("drill.archive.name") + "/bin/drill-am.sh");
-        commands.add("1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/" + ApplicationConstants.STDOUT);
-        commands.add("2>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/" + ApplicationConstants.STDERR);
-        StringBuilder amCommand = new StringBuilder();
-        for (String str : commands) {
-            amCommand.append(str).append(" ");
-        }
-        amCommand.setLength(amCommand.length() - " ".length());
-        amContainer.setCommands(Collections.singletonList(amCommand.toString()));
+        amContainer.setCommands(YarnUtil.buildCommand(drillFileStatus.getPath().getName() + "/" +
+                config.getProperty("drill.archive.name") + "/bin/drill-am.sh"));
         System.out.println("end set am container command");
     }
 
     private void setAMContainerEnvironment(ContainerLaunchContext amContainer, Configuration yarnConfig, Properties config) {
         System.out.println("start set am container environment");
-        Map<String, String> amEnvironment = new LinkedHashMap<>();
-        // add Hadoop Classpath
-        for (String classpath : yarnConfig.getStrings(YarnConfiguration.YARN_APPLICATION_CLASSPATH,
-                YarnConfiguration.DEFAULT_YARN_APPLICATION_CLASSPATH)) {
-            Apps.addToEnvironment(amEnvironment, ApplicationConstants.Environment.CLASSPATH.name(),
-                    classpath.trim(), ApplicationConstants.CLASS_PATH_SEPARATOR);
-        }
-        Apps.addToEnvironment(amEnvironment, ApplicationConstants.Environment.CLASSPATH.name(),
-                ApplicationConstants.Environment.PWD.$() + File.separator + "*", ApplicationConstants.CLASS_PATH_SEPARATOR);
-
+        Map<String, String> amEnvironment = YarnUtil.buildCommonEnvironment(yarnConfig);
         // DRILL_ON_YARN_CONFIG -> config
         try {
             StringWriter sw = new StringWriter();
@@ -235,18 +209,32 @@ public class DrillOnYarnClient extends Configured implements Tool {
         System.out.println("end set am container environment");
     }
 
-    private void reportApplication(Properties config, YarnClient client, ApplicationId applicationId) throws YarnException, IOException {
+    private void reportApplication(YarnClient client, ApplicationId applicationId) {
+        ApplicationReport report;
+        try {
+            report = client.getApplicationReport(applicationId);
+        } catch (YarnException | IOException e) {
+            throw new RuntimeException(e);
+        }
+        YarnApplicationState applicationState = report.getYarnApplicationState();
         int i = 0;
-        while(true) {
-            if (i == 180) {
+        while (true) {
+            if (i == 60) {
                 break;
             }
-            ApplicationReport report = client.getApplicationReport(applicationId);
-            System.out.println(String.format("Launched a %d %s Drill-On-YARN cluster [%s@%s] at %tc",
-                    Integer.parseInt(config.getProperty("containers.num")),
-                    (Integer.parseInt(config.getProperty("containers.num")) > 1 ? "nodes" : "node"),
-                    applicationId, report.getTrackingUrl(),
-                    report.getStartTime()));
+            if (YarnApplicationState.KILLED.equals(applicationState)) {
+                System.out.println("application " + applicationId + " killed");
+                break;
+            }
+            if (YarnApplicationState.FAILED.equals(applicationState)) {
+                System.out.println("application " + applicationId + " failed");
+                break;
+            }
+            if (YarnApplicationState.FINISHED.equals(applicationState)) {
+                System.out.println("application " + applicationId + " finished");
+                break;
+            }
+            System.out.println("application " + applicationId + " " + applicationState.name().toLowerCase());
             try {
                 Thread.sleep(1000);
             } catch (InterruptedException e) {
@@ -254,26 +242,22 @@ public class DrillOnYarnClient extends Configured implements Tool {
             }
             i++;
         }
-
+        System.out.println("application " + applicationId + " " + applicationState.name().toLowerCase() + ", tracking url " + report.getTrackingUrl());
     }
 
     private void closeYarnClient(YarnClient client) {
         try {
-            System.out.println("start close yarn client");
+            System.out.println("start close yarn yarnClient");
             client.close();
-            System.out.println("end close yarn client");
+            System.out.println("end close yarn yarnClient");
         } catch (IOException e) {
-            throw new RuntimeException("close yarn client error", e);
+            throw new RuntimeException("close yarn yarnClient error", e);
         }
     }
 
     private void submitApplication(YarnClient client, ApplicationSubmissionContext applicationContext) {
         System.out.println("start submit application");
-        try {
-            client.submitApplication(applicationContext);
-        } catch (YarnException | IOException e) {
-            throw new RuntimeException("submit application error", e);
-        }
+        YarnUtil.submitApplication(client, applicationContext);
         System.out.println("end submit application");
     }
 
