@@ -1,0 +1,7 @@
+Usage:
+     start  : 启动Drill on YARN
+     stop   : 停止Drill on YARN
+     status : 查看Drill on YARN集群状态
+     resize : 调整Drill on YARN集群
+     help   : 打印帮助信息
+     config : 查看Drill on YARN配置信息
